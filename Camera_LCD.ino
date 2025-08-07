@@ -2,33 +2,29 @@
 #include <TFT_eSPI.h>
 #include "esp_camera.h"
 
+// Shared volatile flag for interrupt communication
+volatile bool captureRequested = false;
+volatile unsigned long lastInterruptTime = 0;
+const unsigned long debounceDelay = 200; // 200ms debounce
+
 #define TFT_GREY 0x5AEB
-// ===================
-// Select camera model
-// ===================
-//define CAMERA_MODEL_WROVER_KIT // Has PSRAM
-//#define CAMERA_MODEL_ESP_EYE // Has PSRAM
-#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM
-//#define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM
-//#define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM
-//#define CAMERA_MODEL_AI_THINKER // Has PSRAM
-//#define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM
-// ** Espressif Internal Boards **
-//define CAMERA_MODEL_ESP32_CAM_BOARD
-//#define CAMERA_MODEL_ESP32S2_CAM_BOARD
-//#define CAMERA_MODEL_ESP32S3_CAM_LCD
+#define CAMERA_MODEL_ESP32S3_EYE
 #include "camera_pins.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
+// Use a different GPIO pin (GPIO4 is safer than GPIO1)
+#define TRIGGER_PIN 1  // Changed from GPIO1 to avoid UART conflict
+int val = 0; 
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Initializing...");
+  pinMode(2, INPUT);
+  
+  
 
-  // Camera config (RGB565 mode)
+  // Camera config
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -49,60 +45,89 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;  // 320x240
-  config.pixel_format = PIXFORMAT_RGB565;  // <<-- RGB565 for BMP
+  config.frame_size = FRAMESIZE_QVGA;
+  config.pixel_format = PIXFORMAT_RGB565;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.fb_count = 1;
+  
   if(psramFound()){
+    Serial.println("Found");
     config.jpeg_quality = 15;
     config.fb_count = 2;
     config.grab_mode = CAMERA_GRAB_LATEST;
   } else {
-    // Limit the frame size when PSRAM is not available
+    Serial.println("NotFound");
     config.frame_size = FRAMESIZE_QVGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
+    //config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
   }
+
   // Initialize camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
-    return;
+    while(1); // Halt if camera fails
   }
 
-  // Adjust sensor settings
+  // Sensor settings
   sensor_t *s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
-  s->set_brightness(s, 1);
-  s->set_saturation(s, 0);
+  s->set_brightness(s, -1);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, 2);
+  s->set_special_effect(s, 0);
+  s->set_aec2(s, 1);
 
   // Initialize TFT
-  Serial.println("Initializing TFT");
   tft.begin();
+  if (!tft.width() || !tft.height()) {
+    Serial.println("TFT initialization failed");
+    while(1); // Halt if TFT fails
+  }
   tft.setRotation(1);
-  Serial.println("FillingScreen");
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE);
-  tft.println("Camera Ready (BMP Mode)");
-  delay(1000);
+  tft.println("Camera Ready");
+
+  // Setup interrupt
+  pinMode(TRIGGER_PIN, INPUT);
+  attachInterrupt(TRIGGER_PIN, GrabOneImg, FALLING);//digitalPinToInterrupt(TRIGGER_PIN), GrabOneImg, FALLING);
+
+  Serial.println("System Ready");
+}
+
+void GrabOneImg() {
+  unsigned long currentTime = millis();
+  //Serial.println(captureRequested);
+  if (currentTime - lastInterruptTime > debounceDelay) {
+    captureRequested = true;
+    lastInterruptTime = currentTime;
+    
+  }
 }
 
 void loop() {
-  // Capture frame (RGB565)
-  Serial.println("Grabbing");
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    delay(1000);
-    return;
+  if (captureRequested) {
+    captureRequested = false;
+    Serial.println("Capturing image...");
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Capture failed");
+      tft.fillScreen(TFT_BLACK);
+      tft.setCursor(0, 0);
+      tft.println("Capture Failed");
+      return;
+    }
+
+    tft.pushImage(0, 0, 320, 240, (uint16_t *)fb->buf);
+    esp_camera_fb_return(fb);
+    
+    Serial.println("Image displayed");
   }
-
-  // Display RGB565 directly on TFT
-  Serial.println("Pushing");
-  tft.pushImage(0, 0, 320, 240, (uint16_t *)fb->buf);  // Assumes QVGA (320x240)
-
-  // Release frame buffer
-  esp_camera_fb_return(fb);
-
-  // Small delay (~10FPS)
-  delay(50);
+  val = analogRead(2);
+  Serial.println(val);
+  delay(1000); // Small delay to prevent watchdog issues
 }
