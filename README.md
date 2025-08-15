@@ -1,4 +1,8 @@
-Board: ESP32S3
-Board Manager Ver: 2.0.14
-Lib: 
-TFT_eSPI 2.5.43
+# ESP32_Camera
+
+##Support Function:
+Live Video
+Save BMP
+HSV Control
+
+##Pin Used:
