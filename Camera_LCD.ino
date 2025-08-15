@@ -2,6 +2,8 @@
 #include <TFT_eSPI.h>
 #include "esp_camera.h"
 #include "sd_read_write.h"
+#include "img_computing.h"
+#include "time.h"
 
 // Shared volatile flag for interrupt communication
 volatile bool captureRequested = false;
@@ -22,8 +24,10 @@ TFT_eSPI tft = TFT_eSPI();
 int val = 0;
 int mappedAEC = 300;
 int lastAEC = 300;
-int tint[3] = {255, 255, 255};
+//int tint[3] = {255, 255, 255};
 int photo_index = 0;
+bool GrabbingMode = 0;
+
 
 
 void setup() {
@@ -84,16 +88,16 @@ void setup() {
 
   sensor_t *s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
-  s->set_brightness(s, -1);
+  s->set_brightness(s, 0);
   s->set_contrast(s, 1);
-  s->set_saturation(s, 2);
+  s->set_saturation(s, 0);
   s->set_special_effect(s, 0);
   
   // 关键曝光控制设置
-  s->set_exposure_ctrl(s, 0);   // 启用手动曝光
-  s->set_aec2(s, 1);            // 禁用AEC2
-  s->set_gain_ctrl(s, 0);       // 禁用自动增益控制
-  s->set_agc_gain(s, 0);        // 固定增益值
+  //s->set_exposure_ctrl(s, 0);   // 启用手动曝光
+  //s->set_aec2(s, 1);            // 禁用AEC2
+  //s->set_gain_ctrl(s, 0);       // 禁用自动增益控制
+  //s->set_agc_gain(s, 0);        // 固定增益值
   //s->set_aec_value(s, mappedAEC);
 
   // Initialize TFT
@@ -171,57 +175,62 @@ void fixEndianness(uint16_t *buf, size_t len) {
     }
 }
 
-void loop() {
-  if (captureRequested) {
-    captureRequested = false;
+void fixEndianness_fast(uint16_t *buf, size_t len) {
+    uint32_t *buf32 = (uint32_t *)buf;
+    size_t len32 = len / 2;
     
-    /*
-    // 1. 先读取当前光照值
-    val = analogRead(2);
-    mappedAEC = map(val, 0, 4095, 0, 1200);
-    
-    // 2. 只有当曝光值变化超过阈值时才更新
-    if(abs(mappedAEC - lastAEC) > 50 ) { // 阈值设为50防止微小波动
-      
-      sensor_t *s = esp_camera_sensor_get();
-      //int pervious_expo = s->get_aec_value(s);
-      //Serial.println(pervious_expo);
-      s->set_aec_value(s, mappedAEC);
-      lastAEC = mappedAEC;
-      
-      // 3. 丢弃2帧确保新曝光生效
-      for(int i=0; i<2; i++) {
-        camera_fb_t* fb = esp_camera_fb_get();
-        if(fb) esp_camera_fb_return(fb);
-        delay(100);
-      }
-    }*/
-    
-    // 4. 获取最终图像
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("捕获失败");
-      tft.fillScreen(TFT_BLACK);
-      tft.println("捕获失败");
-      Serial.println("GrabFail");
-      return;
+    // Process 2 pixels at a time
+    for(size_t i = 0; i < len32; i++) {
+        uint32_t val = buf32[i];
+        buf32[i] = ((val & 0xFF00FF00) >> 8) | ((val & 0x00FF00FF) << 8);
     }
-
-    // 5. 显示图像
     
+    // Handle remaining odd pixel if exists
+    if(len & 1) {
+        buf[len-1] = __builtin_bswap16(buf[len-1]);
+    }
+}
+
+void loop() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("捕获失败");
+    tft.fillScreen(TFT_BLACK);
+    tft.println("捕获失败");
+    Serial.println("GrabFail");
+    return;
+  }
+
     uint16_t* processedBuffer = (uint16_t*)malloc(320*240*sizeof(uint16_t));
     memcpy(processedBuffer, fb->buf, 320*240*sizeof(uint16_t));
-    //applyRGBtint(processedBuffer, 320, 240, tint);
-    tft.pushImage(0, 0, 320, 240, processedBuffer);//(uint16_t *)fb->buf);
     String path = "/camera/" + String(photo_index) +".bmp";
-    
-    fixEndianness(processedBuffer,  320 * 240);
-    writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);
-    photo_index = photo_index+1;
+
+    if(GrabbingMode == 0)
+    {
+      tft.pushImage(0, 0, 320, 240, processedBuffer);
+      if (captureRequested) {
+        captureRequested = false;
+        fixEndianness_fast(processedBuffer,  320 * 240);
+        writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);    
+        photo_index = photo_index+1;
+      }
+    }
+    else{
+      val = analogRead(2);
+      mappedAEC = map(val, 0, 4095, 0, 360);
+      fixEndianness_fast(processedBuffer,  320 * 240);
+      adjust_hue_rgb565_inplace(processedBuffer,320,240,mappedAEC);
+      if (captureRequested) {
+        captureRequested = false;
+        writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);
+        photo_index = photo_index+1;
+      }
+      fixEndianness_fast(processedBuffer,  320 * 240);
+      tft.pushImage(0, 0, 320, 240, processedBuffer);
+
+    }
     free(processedBuffer);
-    esp_camera_fb_return(fb);
-    
-    //Serial.printf("亮度值: %d -> 曝光值: %d\n", val, lastAEC );
-  }
+
+  esp_camera_fb_return(fb);
   delay(10);
 }

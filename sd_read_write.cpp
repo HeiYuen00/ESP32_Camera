@@ -352,7 +352,7 @@ void writeBMP_RGB565(fs::FS &fs, const char *path, const uint16_t *rgb565Buf, si
 
     // 4. 转换并写入像素数据
     uint8_t rowBuffer[rowSize];
-    for (int32_t y = height - 1; y >= 0; y--) { // BMP从底部开始存储
+    for (int32_t y = 0; y < height; y++) { // BMP从底部开始存储
         size_t bufIndex = 0;
         for (size_t x = 0; x < width; x++) {
             uint16_t pixel = rgb565Buf[y * width + x];
