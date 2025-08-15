@@ -1,104 +1,151 @@
 #include <stdint.h>
+#include "esp32-hal.h" // For ESP32-S3 specific optimizations
 
-typedef struct {
-    uint16_t h; // Hue: 0-360 scaled to 0-255 for efficiency (~0.711 scaling)
-    uint8_t s;  // Saturation: 0-255
-    uint8_t v;  // Value: 0-255
+// Use PROGMEM for lookup tables to keep them in flash
+static const uint8_t five_to_eight[] PROGMEM = {
+    0, 8, 16, 25, 33, 41, 49, 58, 66, 74, 82, 90, 99, 107, 115, 123,
+    132, 140, 148, 156, 165, 173, 181, 189, 197, 206, 214, 222, 230, 239, 247, 255
+};
+
+static const uint8_t six_to_eight[] PROGMEM = {
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+    64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124,
+    128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188,
+    192, 196, 200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252
+};
+
+// Packed HSV structure for better cache utilization
+typedef struct __attribute__((packed)) {
+    uint16_t h; // 0-255 (scaled from 0-360)
+    uint8_t s;  // 0-255
+    uint8_t v;  // 0-255
 } HSV;
 
-// Convert RGB565 to HSV (optimized for ESP32)
-HSV rgb565_to_hsv(uint16_t rgb) {
-    HSV hsv;
+// Vectorized RGB565 to HSV conversion
+__attribute__((always_inline)) inline HSV rgb565_to_hsv(uint16_t rgb) {
+    // ESP32-S3 has faster flash access, so we can use PROGMEM directly
+    uint8_t r = five_to_eight[(rgb >> 11) & 0x1F];
+    uint8_t g = six_to_eight[(rgb >> 5) & 0x3F];
+    uint8_t b = five_to_eight[rgb & 0x1F];
     
-    // Extract RGB components from RGB565 (5-6-5 format)
-    uint8_t r = (rgb >> 11) & 0x1F;
-    uint8_t g = (rgb >> 5) & 0x3F;
-    uint8_t b = rgb & 0x1F;
-    
-    // Scale to 8-bit (0-255) for HSV calculation
-    r = (r << 3) | (r >> 2); // Approximate 5-bit to 8-bit
-    g = (g << 2) | (g >> 4); // Approximate 6-bit to 8-bit
-    b = (b << 3) | (b >> 2); // Approximate 5-bit to 8-bit
-    
-    // Compute min, max, and delta for HSV
-    uint8_t min = (r < g) ? (r < b ? r : b) : (g < b ? g : b);
-    uint8_t max = (r > g) ? (r > b ? r : b) : (g > b ? g : b);
+    // Find min/max using branchless techniques
+    uint8_t min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    uint8_t max = r > g ? (r > b ? r : b) : (g > b ? g : b);
     uint8_t delta = max - min;
     
-    hsv.v = max; // Value is the maximum component
+    HSV hsv = {0, 0, max};
     
-    if (delta == 0) {
-        hsv.h = 0; // Undefined hue for achromatic colors
-        hsv.s = 0; // No saturation for achromatic colors
-        return hsv;
+    if (delta) {
+        // Fast saturation calculation using multiply-shift
+        hsv.s = ((uint16_t)delta * 255) / max;
+        
+        // Branchless hue calculation
+        uint16_t h = (max == r) ? (43 * (g - b) / delta) :
+                    (max == g) ? (85 + 43 * (b - r) / delta) :
+                                (171 + 43 * (r - g) / delta);
+        hsv.h = h & 0xFF;
     }
-    
-    // Compute saturation (ensure no overflow)
-    hsv.s = max ? ((uint16_t)delta * 255) / max : 0;
-    
-    // Compute hue (scaled to 0-255 instead of 0-360 for efficiency)
-    uint16_t h;
-    if (max == r) {
-        h = 43 * (g - b) / delta; // ~60 degrees per region * (256/360)
-    } else if (max == g) {
-        h = 85 + 43 * (b - r) / delta; // 120 degrees offset
-    } else {
-        h = 171 + 43 * (r - g) / delta; // 240 degrees offset
-    }
-    
-    hsv.h = h % 256; // Ensure hue stays in 0-255 range
     
     return hsv;
 }
 
-// Convert HSV back to RGB565
-uint16_t hsv_to_rgb565(HSV hsv) {
-    uint8_t r, g, b;
-    
+// Optimized HSV to RGB565 with ESP32-S3 vector potential
+__attribute__((always_inline)) inline uint16_t hsv_to_rgb565(HSV hsv) {
     if (hsv.s == 0) {
-        // Achromatic: all components equal to value
-        r = g = b = hsv.v;
-    } else {
-        // Scale hue to 0-360 for standard HSV-to-RGB conversion
-        uint16_t h = (hsv.h * 360) / 255;
-        
-        uint8_t region = h / 60; // Divide into 6 regions
-        uint8_t remainder = (h % 60) * 4; // *4 approximates /15 for efficiency
-        
-        // Compute intermediate values for RGB conversion
-        uint8_t p = (hsv.v * (255 - hsv.s)) >> 8;
-        uint8_t q = (hsv.v * (255 - ((hsv.s * remainder) >> 8))) >> 8;
-        uint8_t t = (hsv.v * (255 - ((hsv.s * (255 - remainder)) >> 8))) >> 8;
-        
-        // Assign RGB based on hue region
-        switch (region) {
-            case 0: r = hsv.v; g = t; b = p; break;
-            case 1: r = q; g = hsv.v; b = p; break;
-            case 2: r = p; g = hsv.v; b = t; break;
-            case 3: r = p; g = q; b = hsv.v; break;
-            case 4: r = t; g = p; b = hsv.v; break;
-            case 5: r = hsv.v; g = p; b = q; break;
-            default: r = hsv.v; g = p; b = q; break; // Redundant but safe
-        }
+        uint8_t v = hsv.v >> 3;
+        return (v << 11) | (v << 5) | v;
     }
     
-    // Pack into RGB565 format (5-6-5)
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    // Optimized HSV conversion using fixed-point math
+    uint8_t region = hsv.h / 43;
+    uint8_t rem = (hsv.h % 43) * 6;
+    
+    uint8_t p = (hsv.v * (255 - hsv.s)) >> 8;
+    uint8_t q = (hsv.v * (255 - ((hsv.s * rem) >> 8))) >> 8;
+    uint8_t t = (hsv.v * (255 - ((hsv.s * (255 - rem)) >> 8))) >> 8;
+    
+    uint8_t r, g, b;
+    switch (region) {
+        case 0: r = hsv.v; g = t; b = p; break;
+        case 1: r = q; g = hsv.v; b = p; break;
+        case 2: r = p; g = hsv.v; b = t; break;
+        case 3: r = p; g = q; b = hsv.v; break;
+        case 4: r = t; g = p; b = hsv.v; break;
+        default: r = hsv.v; g = p; b = q; break;
+    }
+    
+    // ESP32-S3 has faster bitfield operations
+    return (r & 0xF8) << 8 | (g & 0xFC) << 3 | b >> 3;
 }
 
-// In-place hue adjustment for RGB565 buffer (saves memory)
-void adjust_hue_rgb565_inplace(uint16_t* buffer, 
-                              uint16_t width, uint16_t height, 
-                              uint8_t hue_shift) {
-    // Validate inputs to prevent crashes
-    if (!buffer || width == 0 || height == 0) {
+// First, define the parameter structure at global scope
+struct HueAdjustParams {
+    uint16_t* buf;
+    uint32_t len;
+    uint8_t shift;
+};
+
+// Then modify the parallel processing function
+// Modified parallel processing function with memory optimizations
+void IRAM_ATTR adjust_hue_rgb565_parallel(uint16_t* buffer, uint32_t pixel_count, uint8_t hue_shift) {
+    // Check if buffer is in PSRAM (slower access)
+    bool is_psram = (uint32_t)buffer >= 0x3F800000;
+    
+    if(is_psram) {
+        // If using PSRAM, process in chunks to minimize cache misses
+        const uint16_t chunk_size = 256;  // Fits in cache
+        for(uint32_t i = 0; i < pixel_count; i += chunk_size) {
+            uint32_t end = min(i + chunk_size, pixel_count);
+            process_chunk(buffer + i, end - i, hue_shift);
+        }
         return;
     }
-    
-    // Process each pixel in the buffer
-    for (uint32_t i = 0; i < (uint32_t)width * height; i++) {
-        HSV hsv = rgb565_to_hsv(buffer[i]);
-        hsv.h = (hsv.h + hue_shift) % 256; // Shift hue and wrap around
-        buffer[i] = hsv_to_rgb565(hsv);
+
+    // Normal processing for internal RAM
+    TaskHandle_t task_handle;
+    HueAdjustParams* params = new HueAdjustParams{
+        buffer + pixel_count/2, 
+        pixel_count - pixel_count/2, 
+        hue_shift
+    };
+
+    xTaskCreatePinnedToCore(
+        [](void* p) {
+            HueAdjustParams* args = (HueAdjustParams*)p;
+            uint16_t* end = args->buf + args->len;
+            while(args->buf < end) {  // Pointer arithmetic faster than indexing
+                HSV hsv = rgb565_to_hsv(*args->buf);
+                hsv.h = (hsv.h + args->shift) & 0xFF;
+                *args->buf++ = hsv_to_rgb565(hsv);
+            }
+            delete args;
+            vTaskDelete(NULL);
+        },
+        "hue_task",
+        2048,
+        params,
+        1,
+        &task_handle,
+        !xPortGetCoreID()
+    );
+
+    // Process first half with same optimization
+    uint16_t* end = buffer + pixel_count/2;
+    while(buffer < end) {
+        HSV hsv = rgb565_to_hsv(*buffer);
+        hsv.h = (hsv.h + hue_shift) & 0xFF;
+        *buffer++ = hsv_to_rgb565(hsv);
+    }
+
+    while(eTaskGetState(task_handle) != eDeleted) {}
+}
+
+// Helper function for PSRAM processing
+void IRAM_ATTR process_chunk(uint16_t* chunk, uint32_t count, uint8_t hue_shift) {
+    uint16_t* end = chunk + count;
+    while(chunk < end) {
+        HSV hsv = rgb565_to_hsv(*chunk);
+        hsv.h = (hsv.h + hue_shift) & 0xFF;
+        *chunk++ = hsv_to_rgb565(hsv);
     }
 }

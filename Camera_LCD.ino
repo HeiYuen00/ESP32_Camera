@@ -3,7 +3,7 @@
 #include "esp_camera.h"
 #include "sd_read_write.h"
 #include "img_computing.h"
-#include "time.h"
+#include <esp_timer.h>
 
 // Shared volatile flag for interrupt communication
 volatile bool captureRequested = false;
@@ -22,11 +22,11 @@ TFT_eSPI tft = TFT_eSPI();
 #define TRIGGER_PIN 1
 #define Value_PIN  2
 int val = 0;
-int mappedAEC = 300;
+uint8_t mappedAEC = 300;
 int lastAEC = 300;
 //int tint[3] = {255, 255, 255};
 int photo_index = 0;
-bool GrabbingMode = 0;
+bool GrabbingMode = 1;
 
 
 
@@ -219,8 +219,13 @@ void loop() {
       val = analogRead(2);
       mappedAEC = map(val, 0, 4095, 0, 360);
       fixEndianness_fast(processedBuffer,  320 * 240);
-      adjust_hue_rgb565_inplace(processedBuffer,320,240,mappedAEC);
+      uint64_t Starttime = esp_timer_get_time();
+      //adjust_hue_rgb565_inplace(processedBuffer,320,240,mappedAEC);
+      adjust_hue_rgb565_parallel(processedBuffer,320*240,mappedAEC);
+      uint64_t Finishtime = esp_timer_get_time();
+      
       if (captureRequested) {
+        Serial.println(Finishtime - Starttime);
         captureRequested = false;
         writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);
         photo_index = photo_index+1;
