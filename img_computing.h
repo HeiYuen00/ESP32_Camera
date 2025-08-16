@@ -78,16 +78,88 @@ __attribute__((always_inline)) inline uint16_t hsv_to_rgb565(HSV hsv) {
     return (r & 0xF8) << 8 | (g & 0xFC) << 3 | b >> 3;
 }
 
-// First, define the parameter structure at global scope
+// Check if color is in specific HSV range
+bool is_in_hue_range(HSV hsv, uint8_t target_hue, uint8_t range = 15) {
+    uint8_t diff = abs(hsv.h - target_hue);
+    return diff < range || (255 - diff) < range;
+}
+
+struct HueAdjustParams_hug {
+    uint16_t* buf;
+    uint32_t len;
+    uint8_t target_hue;
+    uint8_t hue_shift;
+    uint8_t range;
+};
+
+void adjust_specific_hue_parallel(uint16_t* buffer, uint32_t pixel_count,
+                                uint8_t target_hue, uint8_t hue_shift,
+                                uint8_t range = 15) {
+    TaskHandle_t task_handle;
+    HueAdjustParams_hug* params = new HueAdjustParams_hug{
+        buffer + pixel_count/2,
+        pixel_count - pixel_count/2,
+        target_hue,
+        hue_shift,
+        range
+    };
+
+    auto task_func = [](void* p) {
+        HueAdjustParams_hug* args = (HueAdjustParams_hug*)p;
+        for (uint32_t i = 0; i < args->len; i++) {
+            HSV hsv = rgb565_to_hsv(args->buf[i]);
+            if (is_in_hue_range(hsv, args->target_hue, args->range)) {
+                hsv.h = (hsv.h + args->hue_shift) & 0xFF;
+                args->buf[i] = hsv_to_rgb565(hsv);
+            }
+        }
+        delete args;
+        vTaskDelete(NULL);
+    };
+
+    xTaskCreatePinnedToCore(
+        task_func,
+        "hue_task",
+        2048,
+        params,
+        1,
+        &task_handle,
+        !xPortGetCoreID()
+    );
+
+    // Process first half
+    uint32_t half_count = pixel_count/2;
+    for (uint32_t i = 0; i < half_count; i++) {
+        HSV hsv = rgb565_to_hsv(buffer[i]);
+        if (is_in_hue_range(hsv, target_hue, range)) {
+            hsv.h = (hsv.h + hue_shift) & 0xFF;
+            buffer[i] = hsv_to_rgb565(hsv);
+        }
+    }
+
+    while(eTaskGetState(task_handle) != eDeleted) {}
+}
+
+
 struct HueAdjustParams {
     uint16_t* buf;
     uint32_t len;
     uint8_t shift;
 };
 
+// Helper function for PSRAM processing
+void process_chunk(uint16_t* chunk, uint32_t count, uint8_t hue_shift) {
+    uint16_t* end = chunk + count;
+    while(chunk < end) {
+        HSV hsv = rgb565_to_hsv(*chunk);
+        hsv.h = (hsv.h + hue_shift) & 0xFF;
+        *chunk++ = hsv_to_rgb565(hsv);
+    }
+}
+
 // Then modify the parallel processing function
 // Modified parallel processing function with memory optimizations
-void IRAM_ATTR adjust_hue_rgb565_parallel(uint16_t* buffer, uint32_t pixel_count, uint8_t hue_shift) {
+void adjust_hue_rgb565_parallel(uint16_t* buffer, uint32_t pixel_count, uint8_t hue_shift) {
     // Check if buffer is in PSRAM (slower access)
     bool is_psram = (uint32_t)buffer >= 0x3F800000;
     
@@ -140,12 +212,3 @@ void IRAM_ATTR adjust_hue_rgb565_parallel(uint16_t* buffer, uint32_t pixel_count
     while(eTaskGetState(task_handle) != eDeleted) {}
 }
 
-// Helper function for PSRAM processing
-void IRAM_ATTR process_chunk(uint16_t* chunk, uint32_t count, uint8_t hue_shift) {
-    uint16_t* end = chunk + count;
-    while(chunk < end) {
-        HSV hsv = rgb565_to_hsv(*chunk);
-        hsv.h = (hsv.h + hue_shift) & 0xFF;
-        *chunk++ = hsv_to_rgb565(hsv);
-    }
-}

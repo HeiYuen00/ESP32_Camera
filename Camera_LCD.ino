@@ -4,21 +4,12 @@
 #include "sd_read_write.h"
 #include "img_computing.h"
 #include <esp_timer.h>
+#include "ESP32_OV5640_AF.h"
 
-// Shared volatile flag for interrupt communication
-volatile bool captureRequested = false;
-volatile unsigned long lastInterruptTime = 0;
-volatile unsigned long lastUpdateExposureTime = 0;
-const unsigned long debounceDelay = 200; // 200ms debounce
-const unsigned long UpdateExposureDelay = 5000; // 1000ms debounce
-
-#define TFT_GREY 0x5AEB
 #define CAMERA_MODEL_ESP32S3_EYE
 #include "camera_pins.h"
 
-
-TFT_eSPI tft = TFT_eSPI();
-
+#define TFT_GREY 0x5AEB
 #define TRIGGER_PIN 1
 #define Value_PIN  2
 int val = 0;
@@ -26,8 +17,17 @@ uint8_t mappedAEC = 300;
 int lastAEC = 300;
 //int tint[3] = {255, 255, 255};
 int photo_index = 0;
-bool GrabbingMode = 1;
+bool GrabbingMode = 0;
+// Shared volatile flag for interrupt communication
+volatile int captureRequested = 0;
+volatile unsigned long lastInterruptTime = 0;
+volatile unsigned long lastUpdateExposureTime = 0;
+const unsigned long debounceDelay = 200; // 200ms debounce
+const unsigned long UpdateExposureDelay = 5000; // 1000ms debounce
 
+
+TFT_eSPI tft = TFT_eSPI();
+OV5640 ov5640 = OV5640();
 
 
 void setup() {
@@ -87,19 +87,43 @@ void setup() {
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  s->set_vflip(s, 1);
-  s->set_brightness(s, 0);
-  s->set_contrast(s, 1);
-  s->set_saturation(s, 0);
-  s->set_special_effect(s, 0);
-  
+
+  // Basic camera settings
+  s->set_vflip(s, 1);        // Vertical flip (if needed)
+  s->set_brightness(s, -2);   // Brightness (0 = default)
+  s->set_contrast(s, -1);     // Contrast (0 = default, 1 = slight increase)
+  s->set_saturation(s, -2);   // Saturation (0 = default)
+  s->set_special_effect(s, 0); // No special effect
+
+  // Auto White Balance (AWB)
+  s->set_wb_mode(s, 0);      // 0 = Auto White Balance
+
+  // Auto Exposure Control (AEC) - Critical for auto exposure
+  s->set_exposure_ctrl(s, 1); // 
+  s->set_aec2(s, 1);         // Enable AEC2 (more advanced auto exposure)
+  s->set_ae_level(s, -2);     // AE level (0 = default, -2 to +2 for adjustments)
+
+  // Auto Gain Control (AGC) - Often needed with auto exposure
+  s->set_gain_ctrl(s, 1);    // Enable automatic gain control
+  s->set_agc_gain(s, 0);     // Auto gain (0 = full auto)
+
   // 关键曝光控制设置
   //s->set_exposure_ctrl(s, 0);   // 启用手动曝光
   //s->set_aec2(s, 1);            // 禁用AEC2
   //s->set_gain_ctrl(s, 0);       // 禁用自动增益控制
   //s->set_agc_gain(s, 0);        // 固定增益值
   //s->set_aec_value(s, mappedAEC);
+  /* 
+  ov5640.start(s);
 
+  if (ov5640.focusInit() == 0) {
+    Serial.println("OV5640_Focus_Init Successful!");
+  }
+
+  if (ov5640.autoFocusMode() == 0) {
+    Serial.println("OV5640_Auto_Focus Successful!");
+  }
+  */
   // Initialize TFT
   tft.begin();
   if (!tft.width() || !tft.height()) {
@@ -121,7 +145,14 @@ void setup() {
 void GrabOneImg() {
   unsigned long currentTime = millis();
   if (currentTime - lastInterruptTime > debounceDelay) {
-    captureRequested = true;
+    Serial.println(captureRequested);
+    if(captureRequested == 2){
+      captureRequested = 0;
+    }
+    else{
+      captureRequested = 1;
+    }
+    Serial.println(captureRequested);
     lastInterruptTime = currentTime;
   }
 }
@@ -192,14 +223,29 @@ void fixEndianness_fast(uint16_t *buf, size_t len) {
 }
 
 void loop() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("捕获失败");
-    tft.fillScreen(TFT_BLACK);
-    tft.println("捕获失败");
-    Serial.println("GrabFail");
-    return;
-  }
+  if(captureRequested != 2)
+  {
+    /*
+    uint8_t rc = ov5640.getFWStatus();
+    Serial.printf("FW_STATUS = 0x%x\n", rc);
+
+    if (rc == -1) {
+      Serial.println("Check your OV5640");
+    } else if (rc == FW_STATUS_S_FOCUSED) {
+      Serial.println("Focused!");
+    } else if (rc == FW_STATUS_S_FOCUSING) {
+      Serial.println("Focusing!");
+    } else {
+    }
+    */
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("捕获失败");
+      tft.fillScreen(TFT_BLACK);
+      tft.println("捕获失败");
+      Serial.println("GrabFail");
+      return;
+    }
 
     uint16_t* processedBuffer = (uint16_t*)malloc(320*240*sizeof(uint16_t));
     memcpy(processedBuffer, fb->buf, 320*240*sizeof(uint16_t));
@@ -208,8 +254,8 @@ void loop() {
     if(GrabbingMode == 0)
     {
       tft.pushImage(0, 0, 320, 240, processedBuffer);
-      if (captureRequested) {
-        captureRequested = false;
+      if (captureRequested == 1) {
+        captureRequested = 2;
         fixEndianness_fast(processedBuffer,  320 * 240);
         writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);    
         photo_index = photo_index+1;
@@ -217,16 +263,17 @@ void loop() {
     }
     else{
       val = analogRead(2);
-      mappedAEC = map(val, 0, 4095, 0, 360);
+      mappedAEC = map(val, 0, 4095, -170, 170);
       fixEndianness_fast(processedBuffer,  320 * 240);
       uint64_t Starttime = esp_timer_get_time();
       //adjust_hue_rgb565_inplace(processedBuffer,320,240,mappedAEC);
       adjust_hue_rgb565_parallel(processedBuffer,320*240,mappedAEC);
+      //adjust_specific_hue_parallel(processedBuffer, 320*240, 170, mappedAEC, 20);
       uint64_t Finishtime = esp_timer_get_time();
       
-      if (captureRequested) {
+      if (captureRequested == 1) {
         Serial.println(Finishtime - Starttime);
-        captureRequested = false;
+        captureRequested = 2;
         writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);
         photo_index = photo_index+1;
       }
@@ -237,5 +284,7 @@ void loop() {
     free(processedBuffer);
 
   esp_camera_fb_return(fb);
-  delay(10);
+  }
+  
+  delay(1000);
 }
