@@ -4,30 +4,39 @@
 #include "sd_read_write.h"
 #include "img_computing.h"
 #include <esp_timer.h>
-#include "ESP32_OV5640_AF.h"
 
 #define CAMERA_MODEL_ESP32S3_EYE
 #include "camera_pins.h"
 
 #define TFT_GREY 0x5AEB
 #define TRIGGER_PIN 1
+#define NormalMode_PIN 3
+#define FilterMode_PIN 46
 #define Value_PIN  2
+#define DirA_PIN 14 
+#define DirB_PIN 20
 int val = 0;
 uint8_t mappedAEC = 300;
 int lastAEC = 300;
 //int tint[3] = {255, 255, 255};
 int photo_index = 0;
-bool GrabbingMode = 0;
 // Shared volatile flag for interrupt communication
 volatile int captureRequested = 0;
 volatile unsigned long lastInterruptTime = 0;
+volatile unsigned long lastInterruptTime_GrabMode = 0;
+volatile unsigned long lastInterruptTime_Butt = 0;
+volatile bool GrabbingMode = 0;
 volatile unsigned long lastUpdateExposureTime = 0;
-const unsigned long debounceDelay = 200; // 200ms debounce
+const unsigned long debounceDelay = 200; 
 const unsigned long UpdateExposureDelay = 5000; // 1000ms debounce
+ColorAdjustment my_adjustments[] = {
+    {HUE_BLUE, 43, 25, 15},    // 藍→紫
+    {HUE_RED, 43, 20, 5},      // 紅→黃
+    {HUE_GREEN, -20, 15, 50}   // 綠微調
+};
 
 
 TFT_eSPI tft = TFT_eSPI();
-OV5640 ov5640 = OV5640();
 
 
 void setup() {
@@ -75,8 +84,7 @@ void setup() {
     Serial.println("NotFound");
     config.frame_size = FRAMESIZE_QVGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_count = 1;
   }
 
   // Initialize camera
@@ -90,9 +98,9 @@ void setup() {
 
   // Basic camera settings
   s->set_vflip(s, 1);        // Vertical flip (if needed)
-  s->set_brightness(s, -2);   // Brightness (0 = default)
-  s->set_contrast(s, -1);     // Contrast (0 = default, 1 = slight increase)
-  s->set_saturation(s, -2);   // Saturation (0 = default)
+  s->set_brightness(s, 2);   // Brightness (0 = default)
+  s->set_contrast(s, 0);     // Contrast (0 = default, 1 = slight increase)
+  s->set_saturation(s, 0);   // Saturation (0 = default)
   s->set_special_effect(s, 0); // No special effect
 
   // Auto White Balance (AWB)
@@ -135,71 +143,91 @@ void setup() {
   tft.setTextColor(TFT_WHITE);
   tft.println("Camera Ready");
 
-  // Setup interrupt
+  // Setup Grabbing interrupt
   pinMode(TRIGGER_PIN, INPUT);
+  pinMode(NormalMode_PIN, INPUT);
+  pinMode(FilterMode_PIN, INPUT);
   attachInterrupt(TRIGGER_PIN, GrabOneImg, FALLING);
-
+  attachInterrupt(NormalMode_PIN, NormalGrabMode_EN, RISING);
+  attachInterrupt(FilterMode_PIN, NormalGrabMode_DIS, RISING);
+  //Setup Direction Button
+  pinMode(DirA_PIN, INPUT);
+  pinMode(DirB_PIN, INPUT);
+  Serial.println("DoneSetupInputPIN");
+  attachInterrupt(DirA_PIN, TriggerA, FALLING);
+  attachInterrupt(DirB_PIN, TriggerB, FALLING);
+  //Done
+  
+  initGrabMode();
   Serial.println("System Ready");
 }
 
+//Grabbing Mode Control
+void initGrabMode(){
+  GrabbingMode = digitalRead(NormalMode_PIN);
+  Serial.println(GrabbingMode);
+}
+
+void NormalGrabMode(bool Normal_EN){
+  GrabbingMode = Normal_EN;
+  Serial.println(GrabbingMode);
+}
+
+void NormalGrabMode_EN(){
+  unsigned long currentTime = millis();
+  if (currentTime - lastInterruptTime_GrabMode > debounceDelay) {
+    NormalGrabMode(1);
+  }
+  lastInterruptTime_GrabMode = currentTime;
+}
+
+void NormalGrabMode_DIS(){
+  unsigned long currentTime = millis();
+  if (currentTime - lastInterruptTime_GrabMode > debounceDelay) {
+    NormalGrabMode(0);
+  }
+  lastInterruptTime_GrabMode = currentTime;
+}
+//
 void GrabOneImg() {
   unsigned long currentTime = millis();
   if (currentTime - lastInterruptTime > debounceDelay) {
-    Serial.println(captureRequested);
+    //Serial.println(captureRequested);
     if(captureRequested == 2){
       captureRequested = 0;
     }
     else{
       captureRequested = 1;
     }
-    Serial.println(captureRequested);
+    //Serial.println(captureRequested);
     lastInterruptTime = currentTime;
   }
 }
+//
 
-void applyRGBtint(uint16_t* imageBuffer, int width, int height, const int rgbTint[3]) {
-    // Extract tint components (0-255)
-    int rTint = rgbTint[0];
-    int gTint = rgbTint[1];
-    int bTint = rgbTint[2];
-
-    // Normalize tint factors (0.0-1.0)
-    float rFactor = rTint / 255.0f;
-    float gFactor = gTint / 255.0f;
-    float bFactor = bTint / 255.0f;
-
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            // Get current pixel index
-            int index = y * width + x;
-            
-            // Extract RGB565 components
-            uint16_t pixel = imageBuffer[index];
-            uint8_t r = (pixel >> 11) & 0x1F;  // 5 bits
-            uint8_t g = (pixel >> 5)  & 0x3F;   // 6 bits
-            uint8_t b = pixel & 0x1F;           // 5 bits
-
-            // Convert to 8-bit (for better tint calculation)
-            r = (r << 3) | (r >> 2);  // 5->8 bits
-            g = (g << 2) | (g >> 4);  // 6->8 bits
-            b = (b << 3) | (b >> 2);  // 5->8 bits
-
-            // Apply tint (multiplicative blending)
-            r = static_cast<uint8_t>(r * rFactor);
-            g = static_cast<uint8_t>(g * gFactor);
-            b = static_cast<uint8_t>(b * bFactor);
-
-            // Convert back to RGB565
-            r = r >> 3;  // 8->5 bits
-            g = g >> 2;  // 8->6 bits
-            b = b >> 3;  // 8->5 bits
-
-            // Recombine into 16-bit pixel
-            imageBuffer[index] = (r << 11) | (g << 5) | b;
-        }
-    }
+//5 dir input
+void checktrigger(int trigger){
+  Serial.println(trigger);
 }
 
+void TriggerA(){
+  unsigned long currentTime = millis();
+  if (currentTime - lastInterruptTime_Butt > debounceDelay) {
+    checktrigger(1);
+  }
+  lastInterruptTime_Butt = currentTime;
+}
+
+void TriggerB(){
+  unsigned long currentTime = millis();
+  if (currentTime - lastInterruptTime_Butt > debounceDelay) {
+    checktrigger(2);
+  }
+  lastInterruptTime_Butt = currentTime;
+}
+//
+
+//Fix Image
 void fixEndianness(uint16_t *buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
         buf[i] = (buf[i] << 8) | (buf[i] >> 8);
@@ -221,6 +249,7 @@ void fixEndianness_fast(uint16_t *buf, size_t len) {
         buf[len-1] = __builtin_bswap16(buf[len-1]);
     }
 }
+//
 
 void loop() {
   if(captureRequested != 2)
@@ -248,27 +277,30 @@ void loop() {
     }
 
     uint16_t* processedBuffer = (uint16_t*)malloc(320*240*sizeof(uint16_t));
+    Serial.println("Memory Pool Setup Done");
     memcpy(processedBuffer, fb->buf, 320*240*sizeof(uint16_t));
     String path = "/camera/" + String(photo_index) +".bmp";
 
-    if(GrabbingMode == 0)
+    if(GrabbingMode == 1)
     {
+      //Serial.println("Update image");
       tft.pushImage(0, 0, 320, 240, processedBuffer);
       if (captureRequested == 1) {
-        captureRequested = 2;
-        fixEndianness_fast(processedBuffer,  320 * 240);
-        writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);    
-        photo_index = photo_index+1;
+          captureRequested = 2;
+          fixEndianness_fast(processedBuffer,  320 * 240);
+          writeBMP_RGB565(SD_MMC, path.c_str(), processedBuffer, 320, 240);    
+          photo_index = photo_index+1;
       }
     }
     else{
       val = analogRead(2);
-      mappedAEC = map(val, 0, 4095, -170, 170);
+      mappedAEC = map(val, 0, 4095, -330, 30);
       fixEndianness_fast(processedBuffer,  320 * 240);
       uint64_t Starttime = esp_timer_get_time();
       //adjust_hue_rgb565_inplace(processedBuffer,320,240,mappedAEC);
-      adjust_hue_rgb565_parallel(processedBuffer,320*240,mappedAEC);
-      //adjust_specific_hue_parallel(processedBuffer, 320*240, 170, mappedAEC, 20);
+      //adjust_hue_rgb565_parallel(processedBuffer,320*240,mappedAEC);
+      //process_noisy_image(processedBuffer, 320, 240);
+      adjust_multiple_colors_parallel(processedBuffer, 320*240, my_adjustments, 3);
       uint64_t Finishtime = esp_timer_get_time();
       
       if (captureRequested == 1) {
@@ -286,5 +318,5 @@ void loop() {
   esp_camera_fb_return(fb);
   }
   
-  delay(1000);
+  delay(10);
 }

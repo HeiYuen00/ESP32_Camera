@@ -11,6 +11,7 @@ void sdmmcInit(void){
     Serial.println("Card Mount Failed");
     return;
   }
+
   uint8_t cardType = SD_MMC.cardType();
   if(cardType == CARD_NONE){
       Serial.println("No SD_MMC card attached");
